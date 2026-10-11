@@ -682,6 +682,114 @@ func TestCloneConcurrentOperationsG(t *testing.T) {
 	}
 }
 
+func TestCloneMutationsDoNotCorruptOriginalG(t *testing.T) {
+	for _, degree := range []int{2, 3, 4, 8, 32} {
+		t.Run(fmt.Sprintf("degree_%d", degree), func(t *testing.T) {
+			const numItems = 2000
+			items := rand.Perm(numItems)
+			tr1 := NewOrderedG[int](degree)
+			for _, v := range items {
+				tr1.ReplaceOrInsert(v)
+			}
+			expectedOriginal := intRange(numItems, false)
+			if got := intAll(tr1); !reflect.DeepEqual(expectedOriginal, got) {
+				t.Fatalf("initial tree mismatch")
+			}
+
+			tr2 := tr1.Clone()
+
+			// Delete odd numbers from clone
+			for i := 1; i < numItems; i += 2 {
+				tr2.Delete(i)
+			}
+
+			// Verify original tree remains unaltered
+			if tr1.Len() != numItems {
+				t.Fatalf("original tree length changed: expected %d, got %d", numItems, tr1.Len())
+			}
+			if got := intAll(tr1); !reflect.DeepEqual(expectedOriginal, got) {
+				t.Fatalf("original tree corrupted after mutating clone")
+			}
+			for _, v := range expectedOriginal {
+				if !tr1.Has(v) {
+					t.Fatalf("original tree missing item %d", v)
+				}
+			}
+
+			// Delete all remaining elements from tr2
+			for i := 0; i < numItems; i += 2 {
+				tr2.Delete(i)
+			}
+			if tr2.Len() != 0 {
+				t.Fatalf("clone tree expected to be empty, got length %d", tr2.Len())
+			}
+
+			// Original tree must still be intact
+			if tr1.Len() != numItems {
+				t.Fatalf("original tree length changed after clearing clone: expected %d, got %d", numItems, tr1.Len())
+			}
+			if got := intAll(tr1); !reflect.DeepEqual(expectedOriginal, got) {
+				t.Fatalf("original tree corrupted after clearing clone")
+			}
+		})
+	}
+}
+
+func TestCloneChainedMutationsCOWSafetyG(t *testing.T) {
+	const count = 500
+	fl := NewFreeListG[int](1000)
+	t1 := NewWithFreeListG[int](2, Less[int](), fl)
+	for i := 0; i < count; i++ {
+		t1.ReplaceOrInsert(i)
+	}
+
+	t2 := t1.Clone()
+	t3 := t2.Clone()
+
+	// Mutate t3 heavily causing child merges and new node allocations
+	for i := 0; i < count; i += 2 {
+		t3.Delete(i)
+	}
+	for i := count; i < count+200; i++ {
+		t3.ReplaceOrInsert(i)
+	}
+
+	// Mutate t2 differently
+	for i := 1; i < count; i += 2 {
+		t2.Delete(i)
+	}
+
+	// Verify t1 is completely untouched
+	want1 := intRange(count, false)
+	if got1 := intAll(t1); !reflect.DeepEqual(want1, got1) {
+		t.Fatalf("t1 corrupted: want len %d, got len %d", len(want1), len(got1))
+	}
+	if t1.Len() != count {
+		t.Fatalf("t1 length mismatch: want %d, got %d", count, t1.Len())
+	}
+
+	// Verify t2 has only even items
+	var want2 []int
+	for i := 0; i < count; i += 2 {
+		want2 = append(want2, i)
+	}
+	if got2 := intAll(t2); !reflect.DeepEqual(want2, got2) {
+		t.Fatalf("t2 contents mismatch")
+	}
+
+	// Verify t3 has only odd items plus new items
+	var want3 []int
+	for i := 1; i < count; i += 2 {
+		want3 = append(want3, i)
+	}
+	for i := count; i < count+200; i++ {
+		want3 = append(want3, i)
+	}
+	if got3 := intAll(t3); !reflect.DeepEqual(want3, got3) {
+		t.Fatalf("t3 contents mismatch")
+	}
+}
+
 func BenchmarkDeleteAndRestoreG(b *testing.B) {
 	items := rand.Perm(16392)
 	b.ResetTimer()
