@@ -1081,3 +1081,389 @@ func (t *BTree) Len() int {
 func (t *BTree) Clear(addNodesToFreelist bool) {
 	(*BTreeG[Item])(t).Clear(addNodesToFreelist)
 }
+
+// KeyCompareFunc compares a search key of type K with an item of type T.
+// It returns:
+//   negative if key < item
+//   zero     if key == item
+//   positive if key > item
+type KeyCompareFunc[K, T any] func(key K, item T) int
+
+// KeyCompare returns a KeyCompareFunc using a key extractor and a LessFunc on the key type.
+func KeyCompare[T, K any](keyFn func(T) K, less LessFunc[K]) KeyCompareFunc[K, T] {
+	return func(key K, item T) int {
+		itemKey := keyFn(item)
+		if less(key, itemKey) {
+			return -1
+		}
+		if less(itemKey, key) {
+			return 1
+		}
+		return 0
+	}
+}
+
+// OrderedKeyCompare returns a KeyCompareFunc for ordered key types using the '<' operator.
+func OrderedKeyCompare[T any, K Ordered](keyFn func(T) K) KeyCompareFunc[K, T] {
+	return KeyCompare(keyFn, Less[K]())
+}
+
+// findKey returns the index where an item matching key is located or should be located,
+// and whether an exact match was found.
+func findKey[T, K any](s items[T], key K, cmp KeyCompareFunc[K, T]) (int, bool) {
+	i := sort.Search(len(s), func(i int) bool {
+		return cmp(key, s[i]) <= 0
+	})
+	if i < len(s) && cmp(key, s[i]) == 0 {
+		return i, true
+	}
+	return i, false
+}
+
+func nodeGetKey[T, K any](n *node[T], key K, cmp KeyCompareFunc[K, T]) (_ T, _ bool) {
+	if n == nil {
+		return
+	}
+	i, found := findKey(n.items, key, cmp)
+	if found {
+		return n.items[i], true
+	} else if len(n.children) > 0 {
+		return nodeGetKey(n.children[i], key, cmp)
+	}
+	return
+}
+
+// GetKey looks for an item whose key matches key according to cmp, returning it.
+// It returns (zeroValue, false) if unable to find that item.
+func GetKey[T, K any](t *BTreeG[T], key K, cmp KeyCompareFunc[K, T]) (_ T, _ bool) {
+	if t == nil || t.root == nil {
+		return
+	}
+	return nodeGetKey(t.root, key, cmp)
+}
+
+// HasKey returns true if an item whose key matches key according to cmp is in the tree.
+func HasKey[T, K any](t *BTreeG[T], key K, cmp KeyCompareFunc[K, T]) bool {
+	_, ok := GetKey(t, key, cmp)
+	return ok
+}
+
+// GetKeyBy looks for an item whose extracted key matches key according to less.
+func GetKeyBy[T, K any](t *BTreeG[T], key K, keyFn func(T) K, less LessFunc[K]) (T, bool) {
+	return GetKey(t, key, KeyCompare(keyFn, less))
+}
+
+// GetKeyOrdered looks for an item whose extracted ordered key matches key.
+func GetKeyOrdered[T any, K Ordered](t *BTreeG[T], key K, keyFn func(T) K) (T, bool) {
+	return GetKey(t, key, OrderedKeyCompare[T, K](keyFn))
+}
+
+// HasKeyBy returns true if an item whose extracted key matches key exists in the tree.
+func HasKeyBy[T, K any](t *BTreeG[T], key K, keyFn func(T) K, less LessFunc[K]) bool {
+	return HasKey(t, key, KeyCompare(keyFn, less))
+}
+
+// HasKeyOrdered returns true if an item whose extracted ordered key matches key exists in the tree.
+func HasKeyOrdered[T any, K Ordered](t *BTreeG[T], key K, keyFn func(T) K) bool {
+	return HasKey(t, key, OrderedKeyCompare[T, K](keyFn))
+}
+
+func nodeRemoveKey[T, K any](n *node[T], key K, minItems int, cmp KeyCompareFunc[K, T]) (_ T, _ bool) {
+	i, found := findKey(n.items, key, cmp)
+	if len(n.children) == 0 {
+		if found {
+			return n.items.removeAt(i), true
+		}
+		return
+	}
+	// If we get to here, we have children.
+	if len(n.children[i].items) <= minItems {
+		return nodeGrowChildAndRemoveKey(n, i, key, minItems, cmp)
+	}
+	child := n.mutableChild(i)
+	if found {
+		out := n.items[i]
+		var zero T
+		n.items[i], _ = child.remove(zero, minItems, removeMax)
+		return out, true
+	}
+	return nodeRemoveKey(child, key, minItems, cmp)
+}
+
+func nodeGrowChildAndRemoveKey[T, K any](n *node[T], i int, key K, minItems int, cmp KeyCompareFunc[K, T]) (T, bool) {
+	if i > 0 && len(n.children[i-1].items) > minItems {
+		// Steal from left child
+		child := n.mutableChild(i)
+		stealFrom := n.mutableChild(i - 1)
+		stolenItem := stealFrom.items.pop()
+		child.items.insertAt(0, n.items[i-1])
+		n.items[i-1] = stolenItem
+		if len(stealFrom.children) > 0 {
+			child.children.insertAt(0, stealFrom.children.pop())
+		}
+	} else if i < len(n.items) && len(n.children[i+1].items) > minItems {
+		// Steal from right child
+		child := n.mutableChild(i)
+		stealFrom := n.mutableChild(i + 1)
+		stolenItem := stealFrom.items.removeAt(0)
+		child.items = append(child.items, n.items[i])
+		n.items[i] = stolenItem
+		if len(stealFrom.children) > 0 {
+			child.children = append(child.children, stealFrom.children.removeAt(0))
+		}
+	} else {
+		if i >= len(n.items) {
+			i--
+		}
+		child := n.mutableChild(i)
+		// Merge with right child
+		mergeItem := n.items.removeAt(i)
+		mergeChild := n.children.removeAt(i + 1)
+		child.items = append(child.items, mergeItem)
+		child.items = append(child.items, mergeChild.items...)
+		child.children = append(child.children, mergeChild.children...)
+		n.cow.freeNode(mergeChild)
+	}
+	return nodeRemoveKey(n, key, minItems, cmp)
+}
+
+// DeleteKey removes an item matching key according to cmp from the tree and returns it.
+// If no such item exists, returns (zeroValue, false).
+func DeleteKey[T, K any](t *BTreeG[T], key K, cmp KeyCompareFunc[K, T]) (_ T, _ bool) {
+	if t == nil || t.root == nil || len(t.root.items) == 0 {
+		return
+	}
+	t.root = t.root.mutableFor(t.cow)
+	out, outb := nodeRemoveKey(t.root, key, t.minItems(), cmp)
+	if len(t.root.items) == 0 && len(t.root.children) > 0 {
+		oldroot := t.root
+		t.root = t.root.children[0]
+		t.cow.freeNode(oldroot)
+	}
+	if outb {
+		t.length--
+	}
+	return out, outb
+}
+
+// DeleteKeyBy removes an item whose extracted key matches key according to less.
+func DeleteKeyBy[T, K any](t *BTreeG[T], key K, keyFn func(T) K, less LessFunc[K]) (T, bool) {
+	return DeleteKey(t, key, KeyCompare(keyFn, less))
+}
+
+// DeleteKeyOrdered removes an item whose extracted ordered key matches key.
+func DeleteKeyOrdered[T any, K Ordered](t *BTreeG[T], key K, keyFn func(T) K) (T, bool) {
+	return DeleteKey(t, key, OrderedKeyCompare[T, K](keyFn))
+}
+
+type optionalKey[K any] struct {
+	key   K
+	valid bool
+}
+
+func optKey[K any](k K) optionalKey[K] {
+	return optionalKey[K]{key: k, valid: true}
+}
+
+func emptyKey[K any]() optionalKey[K] {
+	return optionalKey[K]{}
+}
+
+func nodeIterateKey[T, K any](n *node[T], dir direction, start, stop optionalKey[K], includeStart bool, hit bool, cmp KeyCompareFunc[K, T], iter ItemIteratorG[T]) (bool, bool) {
+	var ok bool
+	var index int
+	switch dir {
+	case ascend:
+		if start.valid {
+			index, _ = findKey(n.items, start.key, cmp)
+		}
+		for i := index; i < len(n.items); i++ {
+			if len(n.children) > 0 {
+				if hit, ok = nodeIterateKey(n.children[i], dir, start, stop, includeStart, hit, cmp, iter); !ok {
+					return hit, false
+				}
+			}
+			if !includeStart && !hit && start.valid && cmp(start.key, n.items[i]) >= 0 {
+				hit = true
+				continue
+			}
+			hit = true
+			if stop.valid && cmp(stop.key, n.items[i]) <= 0 {
+				return hit, false
+			}
+			if !iter(n.items[i]) {
+				return hit, false
+			}
+		}
+		if len(n.children) > 0 {
+			if hit, ok = nodeIterateKey(n.children[len(n.children)-1], dir, start, stop, includeStart, hit, cmp, iter); !ok {
+				return hit, false
+			}
+		}
+	case descend:
+		if start.valid {
+			var found bool
+			index, found = findKey(n.items, start.key, cmp)
+			if !found {
+				index = index - 1
+			}
+		} else {
+			index = len(n.items) - 1
+		}
+		for i := index; i >= 0; i-- {
+			if start.valid && cmp(start.key, n.items[i]) <= 0 {
+				if !includeStart || hit || cmp(start.key, n.items[i]) < 0 {
+					continue
+				}
+			}
+			if len(n.children) > 0 {
+				if hit, ok = nodeIterateKey(n.children[i+1], dir, start, stop, includeStart, hit, cmp, iter); !ok {
+					return hit, false
+				}
+			}
+			if stop.valid && cmp(stop.key, n.items[i]) >= 0 {
+				return hit, false
+			}
+			hit = true
+			if !iter(n.items[i]) {
+				return hit, false
+			}
+		}
+		if len(n.children) > 0 {
+			if hit, ok = nodeIterateKey(n.children[0], dir, start, stop, includeStart, hit, cmp, iter); !ok {
+				return hit, false
+			}
+		}
+	}
+	return hit, true
+}
+
+// AscendRangeKey calls the iterator for every value in the tree whose key is
+// in the range [greaterOrEqual, lessThan) according to cmp, until iterator returns false.
+func AscendRangeKey[T, K any](t *BTreeG[T], greaterOrEqual, lessThan K, cmp KeyCompareFunc[K, T], iterator ItemIteratorG[T]) {
+	if t == nil || t.root == nil {
+		return
+	}
+	nodeIterateKey(t.root, ascend, optKey(greaterOrEqual), optKey(lessThan), true, false, cmp, iterator)
+}
+
+// AscendLessThanKey calls the iterator for every value in the tree whose key is
+// strictly less than pivot according to cmp, until iterator returns false.
+func AscendLessThanKey[T, K any](t *BTreeG[T], pivot K, cmp KeyCompareFunc[K, T], iterator ItemIteratorG[T]) {
+	if t == nil || t.root == nil {
+		return
+	}
+	nodeIterateKey(t.root, ascend, emptyKey[K](), optKey(pivot), false, false, cmp, iterator)
+}
+
+// AscendGreaterOrEqualKey calls the iterator for every value in the tree whose key is
+// greater than or equal to pivot according to cmp, until iterator returns false.
+func AscendGreaterOrEqualKey[T, K any](t *BTreeG[T], pivot K, cmp KeyCompareFunc[K, T], iterator ItemIteratorG[T]) {
+	if t == nil || t.root == nil {
+		return
+	}
+	nodeIterateKey(t.root, ascend, optKey(pivot), emptyKey[K](), true, false, cmp, iterator)
+}
+
+// DescendRangeKey calls the iterator for every value in the tree whose key is
+// in the range [lessOrEqual, greaterThan) descending according to cmp, until iterator returns false.
+func DescendRangeKey[T, K any](t *BTreeG[T], lessOrEqual, greaterThan K, cmp KeyCompareFunc[K, T], iterator ItemIteratorG[T]) {
+	if t == nil || t.root == nil {
+		return
+	}
+	nodeIterateKey(t.root, descend, optKey(lessOrEqual), optKey(greaterThan), true, false, cmp, iterator)
+}
+
+// DescendLessOrEqualKey calls the iterator for every value in the tree whose key is
+// less than or equal to pivot descending according to cmp, until iterator returns false.
+func DescendLessOrEqualKey[T, K any](t *BTreeG[T], pivot K, cmp KeyCompareFunc[K, T], iterator ItemIteratorG[T]) {
+	if t == nil || t.root == nil {
+		return
+	}
+	nodeIterateKey(t.root, descend, optKey(pivot), emptyKey[K](), true, false, cmp, iterator)
+}
+
+// DescendGreaterThanKey calls the iterator for every value in the tree whose key is
+// strictly greater than pivot descending according to cmp, until iterator returns false.
+func DescendGreaterThanKey[T, K any](t *BTreeG[T], pivot K, cmp KeyCompareFunc[K, T], iterator ItemIteratorG[T]) {
+	if t == nil || t.root == nil {
+		return
+	}
+	nodeIterateKey(t.root, descend, emptyKey[K](), optKey(pivot), false, false, cmp, iterator)
+}
+
+// Keyed wraps a BTreeG with a key comparator, providing convenient key-based
+// lookup, deletion, and iteration methods without dummy struct allocation.
+type Keyed[K, T any] struct {
+	tree *BTreeG[T]
+	cmp  KeyCompareFunc[K, T]
+}
+
+// NewKeyed creates a Keyed wrapper around an existing BTreeG instance using
+// the provided key comparator.
+func NewKeyed[K, T any](tree *BTreeG[T], cmp KeyCompareFunc[K, T]) *Keyed[K, T] {
+	return &Keyed[K, T]{tree: tree, cmp: cmp}
+}
+
+// NewKeyedBy creates a Keyed wrapper around an existing BTreeG instance using
+// a key extractor function and a key LessFunc.
+func NewKeyedBy[K, T any](tree *BTreeG[T], keyFn func(T) K, less LessFunc[K]) *Keyed[K, T] {
+	return NewKeyed[K, T](tree, KeyCompare(keyFn, less))
+}
+
+// NewKeyedOrdered creates a Keyed wrapper around an existing BTreeG instance using
+// a key extractor function for ordered key types.
+func NewKeyedOrdered[K Ordered, T any](tree *BTreeG[T], keyFn func(T) K) *Keyed[K, T] {
+	return NewKeyed[K, T](tree, OrderedKeyCompare[T, K](keyFn))
+}
+
+// Tree returns the underlying BTreeG.
+func (k *Keyed[K, T]) Tree() *BTreeG[T] {
+	return k.tree
+}
+
+// Get looks for an item matching key in the tree.
+func (k *Keyed[K, T]) Get(key K) (T, bool) {
+	return GetKey(k.tree, key, k.cmp)
+}
+
+// Has returns true if an item matching key is in the tree.
+func (k *Keyed[K, T]) Has(key K) bool {
+	return HasKey(k.tree, key, k.cmp)
+}
+
+// Delete removes an item matching key from the tree, returning it.
+func (k *Keyed[K, T]) Delete(key K) (T, bool) {
+	return DeleteKey(k.tree, key, k.cmp)
+}
+
+// AscendRange calls iterator for items with keys in [greaterOrEqual, lessThan).
+func (k *Keyed[K, T]) AscendRange(greaterOrEqual, lessThan K, iterator ItemIteratorG[T]) {
+	AscendRangeKey(k.tree, greaterOrEqual, lessThan, k.cmp, iterator)
+}
+
+// AscendLessThan calls iterator for items with keys < pivot.
+func (k *Keyed[K, T]) AscendLessThan(pivot K, iterator ItemIteratorG[T]) {
+	AscendLessThanKey(k.tree, pivot, k.cmp, iterator)
+}
+
+// AscendGreaterOrEqual calls iterator for items with keys >= pivot.
+func (k *Keyed[K, T]) AscendGreaterOrEqual(pivot K, iterator ItemIteratorG[T]) {
+	AscendGreaterOrEqualKey(k.tree, pivot, k.cmp, iterator)
+}
+
+// DescendRange calls iterator for items with keys in [lessOrEqual, greaterThan) descending.
+func (k *Keyed[K, T]) DescendRange(lessOrEqual, greaterThan K, iterator ItemIteratorG[T]) {
+	DescendRangeKey(k.tree, lessOrEqual, greaterThan, k.cmp, iterator)
+}
+
+// DescendLessOrEqual calls iterator for items with keys <= pivot descending.
+func (k *Keyed[K, T]) DescendLessOrEqual(pivot K, iterator ItemIteratorG[T]) {
+	DescendLessOrEqualKey(k.tree, pivot, k.cmp, iterator)
+}
+
+// DescendGreaterThan calls iterator for items with keys > pivot descending.
+func (k *Keyed[K, T]) DescendGreaterThan(pivot K, iterator ItemIteratorG[T]) {
+	DescendGreaterThanKey(k.tree, pivot, k.cmp, iterator)
+}
+

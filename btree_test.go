@@ -790,3 +790,335 @@ func BenchmarkDeleteAndRestore(b *testing.B) {
 		}
 	})
 }
+
+type testRecord struct {
+	id    int
+	title string
+	extra string
+}
+
+func testRecordCmp(key int, item testRecord) int {
+	if key < item.id {
+		return -1
+	}
+	if key > item.id {
+		return 1
+	}
+	return 0
+}
+
+func testRecordPtrCmp(key int, item *testRecord) int {
+	if key < item.id {
+		return -1
+	}
+	if key > item.id {
+		return 1
+	}
+	return 0
+}
+
+func TestBTreeGDirectKeyLookup(t *testing.T) {
+	for _, degree := range []int{2, 3, 4, 32} {
+		tr := NewG[testRecord](degree, func(a, b testRecord) bool {
+			return a.id < b.id
+		})
+
+		const count = 500
+		for _, v := range rand.Perm(count) {
+			tr.ReplaceOrInsert(testRecord{
+				id:    v,
+				title: fmt.Sprintf("title-%d", v),
+				extra: "payload",
+			})
+		}
+
+		keyExtractor := func(r testRecord) int { return r.id }
+
+		// Test existing keys across various helper entry points
+		for i := 0; i < count; i++ {
+			// GetKey with custom comparator
+			got, ok := GetKey(tr, i, testRecordCmp)
+			if !ok || got.id != i || got.title != fmt.Sprintf("title-%d", i) {
+				t.Fatalf("degree %d: GetKey(%d) failed: got (%+v, %v)", degree, i, got, ok)
+			}
+
+			// GetKeyOrdered
+			gotOrd, okOrd := GetKeyOrdered(tr, i, keyExtractor)
+			if !okOrd || gotOrd.id != i {
+				t.Fatalf("degree %d: GetKeyOrdered(%d) failed: got (%+v, %v)", degree, i, gotOrd, okOrd)
+			}
+
+			// GetKeyBy
+			gotBy, okBy := GetKeyBy(tr, i, keyExtractor, Less[int]())
+			if !okBy || gotBy.id != i {
+				t.Fatalf("degree %d: GetKeyBy(%d) failed: got (%+v, %v)", degree, i, gotBy, okBy)
+			}
+
+			// HasKey helpers
+			if !HasKey(tr, i, testRecordCmp) {
+				t.Fatalf("degree %d: HasKey(%d) returned false", degree, i)
+			}
+			if !HasKeyOrdered(tr, i, keyExtractor) {
+				t.Fatalf("degree %d: HasKeyOrdered(%d) returned false", degree, i)
+			}
+			if !HasKeyBy(tr, i, keyExtractor, Less[int]()) {
+				t.Fatalf("degree %d: HasKeyBy(%d) returned false", degree, i)
+			}
+		}
+
+		// Test non-existent keys
+		for _, missingKey := range []int{-100, -1, count, count + 1, count + 500} {
+			if got, ok := GetKey(tr, missingKey, testRecordCmp); ok {
+				t.Fatalf("degree %d: expected missing key %d to fail, got (%+v, %v)", degree, missingKey, got, ok)
+			}
+			if HasKey(tr, missingKey, testRecordCmp) {
+				t.Fatalf("degree %d: HasKey(%d) unexpectedly returned true", degree, missingKey)
+			}
+			if got, ok := GetKeyOrdered(tr, missingKey, keyExtractor); ok {
+				t.Fatalf("degree %d: GetKeyOrdered unexpectedly found missing key %d: %+v", degree, missingKey, got)
+			}
+			if HasKeyOrdered(tr, missingKey, keyExtractor) {
+				t.Fatalf("degree %d: HasKeyOrdered unexpectedly returned true for %d", degree, missingKey)
+			}
+		}
+	}
+}
+
+func TestBTreeGDirectKeyLookupPointers(t *testing.T) {
+	tr := NewG[*testRecord](4, func(a, b *testRecord) bool {
+		return a.id < b.id
+	})
+
+	const count = 200
+	for i := 0; i < count; i++ {
+		tr.ReplaceOrInsert(&testRecord{
+			id:    i,
+			title: fmt.Sprintf("name-%d", i),
+		})
+	}
+
+	for i := 0; i < count; i++ {
+		rec, ok := GetKey(tr, i, testRecordPtrCmp)
+		if !ok || rec == nil || rec.id != i {
+			t.Fatalf("GetKey pointer lookup failed for id %d", i)
+		}
+	}
+
+	// Verify zero allocations during direct key search
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = GetKey(tr, 50, testRecordPtrCmp)
+	})
+	if allocs != 0 {
+		t.Fatalf("expected 0 allocations for direct key lookup, got %f", allocs)
+	}
+}
+
+func TestBTreeGDirectKeyDelete(t *testing.T) {
+	for _, degree := range []int{2, 3, 4, 16} {
+		tr := NewG[testRecord](degree, func(a, b testRecord) bool {
+			return a.id < b.id
+		})
+
+		const count = 300
+		for _, v := range rand.Perm(count) {
+			tr.ReplaceOrInsert(testRecord{id: v, title: fmt.Sprintf("item-%d", v)})
+		}
+
+		keyExtractor := func(r testRecord) int { return r.id }
+
+		// Delete non-existent key returns false
+		if _, ok := DeleteKey(tr, 9999, testRecordCmp); ok {
+			t.Fatalf("degree %d: DeleteKey on non-existent key returned true", degree)
+		}
+		if tr.Len() != count {
+			t.Fatalf("degree %d: length changed after failed delete: %d != %d", degree, tr.Len(), count)
+		}
+
+		// Delete elements in random order using distinct delete helpers
+		perm := rand.Perm(count)
+		for i, k := range perm {
+			var deleted testRecord
+			var ok bool
+			switch i % 3 {
+			case 0:
+				deleted, ok = DeleteKey(tr, k, testRecordCmp)
+			case 1:
+				deleted, ok = DeleteKeyOrdered(tr, k, keyExtractor)
+			case 2:
+				deleted, ok = DeleteKeyBy(tr, k, keyExtractor, Less[int]())
+			}
+
+			if !ok || deleted.id != k {
+				t.Fatalf("degree %d: failed to delete key %d: got (%+v, %v)", degree, k, deleted, ok)
+			}
+			if HasKey(tr, k, testRecordCmp) {
+				t.Fatalf("degree %d: key %d still present after deletion", degree, k)
+			}
+			if tr.Len() != count-i-1 {
+				t.Fatalf("degree %d: unexpected length %d after deleting %d elements", degree, tr.Len(), i+1)
+			}
+		}
+
+		if tr.Len() != 0 {
+			t.Fatalf("degree %d: expected empty tree after deleting all elements, got len %d", degree, tr.Len())
+		}
+	}
+}
+
+func TestBTreeGDirectKeyIteration(t *testing.T) {
+	tr := NewG[testRecord](3, func(a, b testRecord) bool {
+		return a.id < b.id
+	})
+
+	for i := 0; i < 100; i++ {
+		tr.ReplaceOrInsert(testRecord{id: i, title: fmt.Sprintf("val-%d", i)})
+	}
+
+	// AscendRangeKey [25, 45)
+	var gotAscend []int
+	AscendRangeKey(tr, 25, 45, testRecordCmp, func(item testRecord) bool {
+		gotAscend = append(gotAscend, item.id)
+		return true
+	})
+	if len(gotAscend) != 20 {
+		t.Fatalf("AscendRangeKey count mismatch: %d != 20", len(gotAscend))
+	}
+	for i, v := range gotAscend {
+		if v != 25+i {
+			t.Fatalf("AscendRangeKey unexpected element at %d: %d != %d", i, v, 25+i)
+		}
+	}
+
+	// AscendLessThanKey 15
+	var gotLess []int
+	AscendLessThanKey(tr, 15, testRecordCmp, func(item testRecord) bool {
+		gotLess = append(gotLess, item.id)
+		return true
+	})
+	if len(gotLess) != 15 || gotLess[0] != 0 || gotLess[14] != 14 {
+		t.Fatalf("AscendLessThanKey mismatch: %+v", gotLess)
+	}
+
+	// AscendGreaterOrEqualKey 85
+	var gotGte []int
+	AscendGreaterOrEqualKey(tr, 85, testRecordCmp, func(item testRecord) bool {
+		gotGte = append(gotGte, item.id)
+		return true
+	})
+	if len(gotGte) != 15 || gotGte[0] != 85 || gotGte[14] != 99 {
+		t.Fatalf("AscendGreaterOrEqualKey mismatch: %+v", gotGte)
+	}
+
+	// DescendRangeKey [60, 40)
+	var gotDescend []int
+	DescendRangeKey(tr, 60, 40, testRecordCmp, func(item testRecord) bool {
+		gotDescend = append(gotDescend, item.id)
+		return true
+	})
+	if len(gotDescend) != 20 || gotDescend[0] != 60 || gotDescend[19] != 41 {
+		t.Fatalf("DescendRangeKey mismatch: len=%d, first=%d, last=%d", len(gotDescend), gotDescend[0], gotDescend[len(gotDescend)-1])
+	}
+
+	// DescendLessOrEqualKey 10
+	var gotLte []int
+	DescendLessOrEqualKey(tr, 10, testRecordCmp, func(item testRecord) bool {
+		gotLte = append(gotLte, item.id)
+		return true
+	})
+	if len(gotLte) != 11 || gotLte[0] != 10 || gotLte[10] != 0 {
+		t.Fatalf("DescendLessOrEqualKey mismatch: %+v", gotLte)
+	}
+
+	// DescendGreaterThanKey 85
+	var gotGt []int
+	DescendGreaterThanKey(tr, 85, testRecordCmp, func(item testRecord) bool {
+		gotGt = append(gotGt, item.id)
+		return true
+	})
+	if len(gotGt) != 14 || gotGt[0] != 99 || gotGt[13] != 86 {
+		t.Fatalf("DescendGreaterThanKey mismatch: %+v", gotGt)
+	}
+
+	// Early termination test
+	var earlyStop []int
+	AscendRangeKey(tr, 10, 50, testRecordCmp, func(item testRecord) bool {
+		earlyStop = append(earlyStop, item.id)
+		return len(earlyStop) < 5
+	})
+	if len(earlyStop) != 5 {
+		t.Fatalf("early stop expected 5 elements, got %d", len(earlyStop))
+	}
+}
+
+func TestKeyedWrapper(t *testing.T) {
+	tr := NewG[testRecord](2, func(a, b testRecord) bool {
+		return a.id < b.id
+	})
+
+	keyed := NewKeyedOrdered(tr, func(r testRecord) int { return r.id })
+	if keyed.Tree() != tr {
+		t.Fatalf("Tree() mismatch")
+	}
+
+	for i := 0; i < 50; i++ {
+		tr.ReplaceOrInsert(testRecord{id: i, title: fmt.Sprintf("k-%d", i)})
+	}
+
+	for i := 0; i < 50; i++ {
+		item, ok := keyed.Get(i)
+		if !ok || item.id != i {
+			t.Fatalf("keyed.Get(%d) failed", i)
+		}
+		if !keyed.Has(i) {
+			t.Fatalf("keyed.Has(%d) returned false", i)
+		}
+	}
+
+	// Test wrapper iteration
+	var collected []int
+	keyed.AscendRange(10, 20, func(item testRecord) bool {
+		collected = append(collected, item.id)
+		return true
+	})
+	if len(collected) != 10 || collected[0] != 10 || collected[9] != 19 {
+		t.Fatalf("keyed.AscendRange mismatch: %+v", collected)
+	}
+
+	// Test wrapper deletion
+	deleted, ok := keyed.Delete(25)
+	if !ok || deleted.id != 25 {
+		t.Fatalf("keyed.Delete(25) failed")
+	}
+	if keyed.Has(25) {
+		t.Fatalf("keyed.Has(25) returned true after deletion")
+	}
+}
+
+func TestBTreeGKeyLookupNilAndEmpty(t *testing.T) {
+	var nilTree *BTreeG[testRecord]
+	if _, ok := GetKey(nilTree, 1, testRecordCmp); ok {
+		t.Fatalf("GetKey on nil tree unexpectedly returned true")
+	}
+	if HasKey(nilTree, 1, testRecordCmp) {
+		t.Fatalf("HasKey on nil tree unexpectedly returned true")
+	}
+	if _, ok := DeleteKey(nilTree, 1, testRecordCmp); ok {
+		t.Fatalf("DeleteKey on nil tree unexpectedly returned true")
+	}
+	AscendRangeKey(nilTree, 0, 10, testRecordCmp, func(item testRecord) bool {
+		t.Fatalf("iteration on nil tree called callback")
+		return true
+	})
+
+	emptyTree := NewG[testRecord](2, func(a, b testRecord) bool { return a.id < b.id })
+	if _, ok := GetKey(emptyTree, 1, testRecordCmp); ok {
+		t.Fatalf("GetKey on empty tree unexpectedly returned true")
+	}
+	if HasKey(emptyTree, 1, testRecordCmp) {
+		t.Fatalf("HasKey on empty tree unexpectedly returned true")
+	}
+	if _, ok := DeleteKey(emptyTree, 1, testRecordCmp); ok {
+		t.Fatalf("DeleteKey on empty tree unexpectedly returned true")
+	}
+}
+
