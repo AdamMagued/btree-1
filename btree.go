@@ -385,6 +385,10 @@ const (
 
 // remove removes an item from the subtree rooted at this node.
 func (n *node) remove(item Item, minItems int, typ toRemove) Item {
+	return n.removeInternal(item, minItems, typ, false)
+}
+
+func (n *node) removeInternal(item Item, minItems int, typ toRemove, grown bool) Item {
 	var i int
 	var found bool
 	switch typ {
@@ -411,7 +415,9 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 	}
 	// If we get to here, we have children.
 	if len(n.children[i].items) <= minItems {
-		return n.growChildAndRemove(i, item, minItems, typ)
+		if !grown {
+			return n.growChildAndRemove(i, item, minItems, typ)
+		}
 	}
 	child := n.mutableChild(i)
 	// Either we had enough items to begin with, or we've done some
@@ -485,7 +491,7 @@ func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) 
 		child.children = append(child.children, mergeChild.children...)
 		n.cow.freeNode(mergeChild)
 	}
-	return n.remove(item, minItems, typ)
+	return n.removeInternal(item, minItems, typ, true)
 }
 
 type direction int

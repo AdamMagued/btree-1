@@ -762,3 +762,40 @@ func BenchmarkDeleteAndRestoreG(b *testing.B) {
 		}
 	})
 }
+
+func TestIssue56G(t *testing.T) {
+	const maxCacheSize = 3
+	less := func(a, b testKCounter) bool {
+		if a.key < b.key {
+			return true
+		}
+		return a.value < b.value
+	}
+	put := func(tr *BTreeG[testKCounter], itemByKey map[string]testKCounter, kc testKCounter) bool {
+		item, ok := itemByKey[kc.key]
+		if ok {
+			tr.Delete(item)
+			tr.ReplaceOrInsert(kc)
+			itemByKey[kc.key] = kc
+			return true
+		}
+		if tr.Len() >= maxCacheSize {
+			smallestItem, _ := tr.Min()
+			if kc.value < smallestItem.value {
+				return false
+			}
+			tr.DeleteMin()
+		}
+		tr.ReplaceOrInsert(kc)
+		itemByKey[kc.key] = kc
+		return true
+	}
+
+	itemByKey := make(map[string]testKCounter)
+	tree := NewG(15, less)
+
+	for i := 0; i < 100000; i++ {
+		put(tree, itemByKey, testKCounter{fmt.Sprintf("%d", i%20), i % 10})
+	}
+}
+
